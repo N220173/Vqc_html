@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>VQC Circuit — mRNA Model</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #161616;
+    color: #f4f4f4;
+    font-family: 'IBM Plex Mono', 'Courier New', monospace;
+    overflow-x: auto;
+  }
+  header {
+    background: #262626;
+    border-bottom: 1px solid #393939;
+    padding: 12px 24px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .ibm-logo {
+    font-size: 20px; font-weight: 700; color: #0f62fe;
+    letter-spacing: -1px;
+  }
+  .title { font-size: 14px; color: #c6c6c6; }
+  .chip { background: #0f62fe22; border: 1px solid #0f62fe88;
+    color: #78a9ff; font-size: 11px; padding: 2px 8px; border-radius: 2px; }
+
+  .toolbar {
+    background: #262626;
+    border-bottom: 1px solid #393939;
+    padding: 8px 24px;
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  }
+  .tb-btn {
+    background: #393939; border: 1px solid #525252; color: #c6c6c6;
+    padding: 4px 12px; font-size: 12px; cursor: pointer; border-radius: 2px;
+    font-family: inherit;
+  }
+  .tb-btn:hover { background: #4c4c4c; }
+  .tb-label { font-size: 11px; color: #8d8d8d; }
+
+  #canvas-wrap {
+    overflow: auto;
+    padding: 24px;
+    min-height: calc(100vh - 100px);
+    cursor: grab;
+  }
+  #canvas-wrap:active { cursor: grabbing; }
+  canvas { display: block; }
+
+  /* tooltip */
+  #tooltip {
+    position: fixed; display: none;
+    background: #393939; border: 1px solid #525252;
+    color: #f4f4f4; font-size: 12px;
+    padding: 8px 12px; border-radius: 2px;
+    pointer-events: none; z-index: 100;
+    max-width: 240px; line-height: 1.6;
+  }
+
+  /* legend */
+  .legend {
+    background: #262626; border-top: 1px solid #393939;
+    padding: 12px 24px;
+    display: flex; gap: 24px; flex-wrap: wrap; align-items: center;
+  }
+  .leg-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #c6c6c6; }
+  .leg-box {
+    width: 28px; height: 20px; border-radius: 2px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; color: #fff;
+  }
+  .leg-ctrl { width: 10px; height: 10px; border-radius: 50%; background: #8a3ffc; }
+  .leg-tgt {
+    width: 20px; height: 20px; border-radius: 50%;
+    border: 2px solid #8a3ffc; display: flex;
+    align-items: center; justify-content: center;
+    font-size: 14px; color: #8a3ffc;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="ibm-logo">IBM</span>
+  <span class="title">Quantum Composer</span>
+  <span class="chip">VQC · mRNA Secondary Structure Model</span>
+  <span class="chip">12 qubits · 4 layers · 144 params</span>
+</header>
+
+<div class="toolbar">
+  <span class="tb-label">Zoom:</span>
+  <button class="tb-btn" onclick="zoom(1.2)">＋</button>
+  <button class="tb-btn" onclick="zoom(0.833)">－</button>
+  <button class="tb-btn" onclick="resetZoom()">Reset</button>
+  <span style="flex:1"></span>
+  <span class="tb-label">AngleEmbedding (RY) + 4× StronglyEntanglingLayer (Rot + CNOT) + ⟨Z⟩ Measure</span>
+</div>
+
+<div id="canvas-wrap">
+  <canvas id="c"></canvas>
+</div>
+
+<div id="tooltip"></div>
+
+<div class="legend">
+  <div class="leg-item">
+    <div class="leg-box" style="background:#0f62fe;">RY</div> AngleEmbedding (input θ)
+  </div>
+  <div class="leg-item">
+    <div class="leg-box" style="background:#198038;">ROT</div> Rot = RZ·RY·RZ (trainable)
+  </div>
+  <div class="leg-item">
+    <div class="leg-ctrl"></div>
+    <div class="leg-tgt">⊕</div>
+    CNOT (entangling, stride = layer)
+  </div>
+  <div class="leg-item">
+    <div class="leg-box" style="background:#9f1853;">⟨Z⟩</div> PauliZ measurement
+  </div>
+  <div class="leg-item" style="color:#8d8d8d; font-size:11px;">
+    n_qubits=12 &nbsp;|&nbsp; n_layers=4 &nbsp;|&nbsp; weights shape (4,12,3)
+  </div>
+</div>
+
+<script>
+const N = 12, LAYERS = 4;
+
+// ---- layout constants ----
+const WIRE_H  = 54;      // vertical spacing between qubits
+const GATE_W  = 44;      // gate box width
+const GATE_H  = 32;      // gate box height
+const PAD_L   = 90;      // left label area
+const PAD_T   = 40;      // top margin
+const PAD_B   = 40;      // bottom margin
+const SEC_GAP = 28;      // gap between sections
+
+// columns: [AngleEmb] gap [Layer1 Rot] [Layer1 CNOT] gap … gap [Meas]
+// Each layer: 1 Rot column + 12 CNOT slots (sequential)
+const COL_RY   = 1;      // 1 column of RY gates
+const COL_ROT  = 1;      // 1 column of Rot per layer
+const CNOT_COLS_PER_LAYER = 12; // 12 sequential CNOTs
+
+function colX(col) { return PAD_L + col * (GATE_W + 8); }
+function wireY(q)  { return PAD_T + q * WIRE_H + WIRE_H / 2; }
+
+// ---- build column layout ----
+let sections = [];
+let col = 0;
+
+// AngleEmbedding section
+let ryCol = col; col++;
+sections.push({ type:'label', col: ryCol - 0.5, text:'AngleEmb', color:'#0f62fe88' });
+
+col++;  // gap
+
+for (let l = 0; l < LAYERS; l++) {
+  let rotCol = col; col++;
+  let cnotStart = col;
+  col += CNOT_COLS_PER_LAYER;
+  sections.push({ type:'layer', l, rotCol, cnotStart });
+  if (l < LAYERS - 1) col++;  // gap
+}
+
+col++; // gap
+let measCol = col; col++;
+
+const TOTAL_COLS = col;
+const W = PAD_L + TOTAL_COLS * (GATE_W + 8) + 60;
+const H = PAD_T + N * WIRE_H + PAD_B;
+
+const canvas = document.getElementById('c');
+canvas.width  = W;
+canvas.height = H;
+const ctx = canvas.getContext('2d');
+
+let scale = 1;
+
+// ---- CNOT targets for each layer ----
+function cnotPairs(l) {
+  const stride = l + 1;
+  return Array.from({length: N}, (_, q) => [q, (q + stride) % N]);
+}
+
+// ---- gate registry (for tooltips) ----
+const gates = [];
+
+function regGate(x, y, w, h, info) {
+  gates.push({ x, y, w, h, info });
+}
+
+// ---- drawing helpers ----
+function drawWire(y) {
+  ctx.beginPath();
+  ctx.moveTo(PAD_L - 10, y);
+  ctx.lineTo(W - 40, y);
+  ctx.strokeStyle = '#525252';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function drawGate(col, q, label, fillColor, borderColor, info) {
+  const x = colX(col) - GATE_W / 2;
+  const y = wireY(q) - GATE_H / 2;
+  ctx.fillStyle = fillColor;
+  ctx.strokeStyle = borderColor || fillColor;
+  ctx.lineWidth = 1.5;
+  roundRect(ctx, x, y, GATE_W, GATE_H, 3);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 11px IBM Plex Mono, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + GATE_W / 2, y + GATE_H / 2);
+  regGate(x, y, GATE_W, GATE_H, info);
+}
+
+function drawControl(col, q) {
+  const x = colX(col);
+  const y = wireY(q);
+  ctx.beginPath();
+  ctx.arc(x, y, 7, 0, Math.PI * 2);
+  ctx.fillStyle = '#8a3ffc';
+  ctx.fill();
+  regGate(x - 7, y - 7, 14, 14, { label:'Control qubit', desc:'CNOT control node' });
+}
+
+function drawTarget(col, ctrl, tgt) {
+  const x = colX(col);
+  const yT = wireY(tgt);
+  const yC = wireY(ctrl);
+
+  // vertical line connecting ctrl and tgt
+  ctx.beginPath();
+  ctx.moveTo(x, yC);
+  ctx.lineTo(x, yT);
+  ctx.strokeStyle = '#8a3ffc';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // target circle
+  ctx.beginPath();
+  ctx.arc(x, yT, 12, 0, Math.PI * 2);
+  ctx.strokeStyle = '#8a3ffc';
+  ctx.lineWidth = 2;
+  ctx.fillStyle = '#8a3ffc22';
+  ctx.fill();
+  ctx.stroke();
+
+  // ⊕ cross inside
+  ctx.beginPath();
+  ctx.moveTo(x - 12, yT);
+  ctx.lineTo(x + 12, yT);
+  ctx.moveTo(x, yT - 12);
+  ctx.lineTo(x, yT + 12);
+  ctx.strokeStyle = '#be95ff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  regGate(x - 12, yT - 12, 24, 24,
+    { label:'CNOT Target', desc:`Target qubit q${tgt} ⊕ control` });
+}
+
+function drawMeas(col, q, qi) {
+  const x = colX(col) - GATE_W / 2;
+  const y = wireY(q) - GATE_H / 2;
+  ctx.fillStyle = '#9f1853';
+  ctx.strokeStyle = '#ff7eb6';
+  ctx.lineWidth = 1.5;
+  roundRect(ctx, x, y, GATE_W, GATE_H, 3);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(x + GATE_W/2, y + GATE_H * 0.72, GATE_H * 0.28, Math.PI, 0);
+  ctx.strokeStyle = '#ffd6e8'; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x + GATE_W/2, y + GATE_H * 0.72);
+  ctx.lineTo(x + GATE_W/2 + GATE_H * 0.22, y + GATE_H * 0.44);
+  ctx.strokeStyle = '#ff7eb6'; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 9px IBM Plex Mono, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText('⟨Z⟩', x + GATE_W/2, y + 3);
+  regGate(x, y, GATE_W, GATE_H,
+    { label:'PauliZ Measurement', desc:`⟨Z${qi}⟩ ∈ [−1, +1] → classical output to regression head` });
+}
+
+function drawSectionBg(x0, x1, label, color) {
+  const y0 = PAD_T / 2;
+  const y1 = H - PAD_B / 2;
+  ctx.fillStyle = color + '18';
+  ctx.strokeStyle = color + '55';
+  ctx.lineWidth = 1;
+  roundRect(ctx, x0 - 6, y0, x1 - x0 + 12, y1 - y0, 4);
+  ctx.fill(); ctx.stroke();
+
+  ctx.fillStyle = color + 'cc';
+  ctx.font = 'bold 11px IBM Plex Mono, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  ctx.fillText(label, (x0 + x1) / 2, y0 - 2);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#161616';
+  ctx.fillRect(0, 0, W, H);
+
+  // alternating row tints
+  for (let q = 0; q < N; q++) {
+    if (q % 2 === 0) {
+      ctx.fillStyle = '#1e1e1e';
+      ctx.fillRect(0, wireY(q) - WIRE_H / 2, W, WIRE_H);
+    }
+  }
+
+  // ---- section backgrounds ----
+  const ryX0 = colX(ryCol) - GATE_W / 2 - 4;
+  const ryX1 = colX(ryCol) + GATE_W / 2 + 4;
+  drawSectionBg(ryX0, ryX1, 'AngleEmbedding', '#0f62fe');
+
+  const layerColors = [
+    { rot:'#198038', rotBdr:'#42be65', label:'Layer 1 (stride 1)' },
+    { rot:'#9f1853', rotBdr:'#ff7eb6', label:'Layer 2 (stride 2)' },
+    { rot:'#b1420a', rotBdr:'#ff832b', label:'Layer 3 (stride 3)' },
+    { rot:'#005d5d', rotBdr:'#3ddbd9', label:'Layer 4 (stride 4)' },
+  ];
+
+  for (let l = 0; l < LAYERS; l++) {
+    const sec = sections.find(s => s.type === 'layer' && s.l === l);
+    const lx0 = colX(sec.rotCol) - GATE_W / 2 - 4;
+    const lx1 = colX(sec.cnotStart + CNOT_COLS_PER_LAYER - 1) + GATE_W / 2 + 4;
+    drawSectionBg(lx0, lx1, layerColors[l].label, layerColors[l].rot);
+  }
+
+  const mX0 = colX(measCol) - GATE_W / 2 - 4;
+  const mX1 = colX(measCol) + GATE_W / 2 + 4;
+  drawSectionBg(mX0, mX1, 'Measure', '#9f1853');
+
+  // ---- wires ----
+  for (let q = 0; q < N; q++) drawWire(wireY(q));
+
+  // ---- qubit labels ----
+  for (let q = 0; q < N; q++) {
+    ctx.fillStyle = '#8d8d8d';
+    ctx.font = '11px IBM Plex Mono, monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(`q[${String(q).padStart(2,'0')}]`, PAD_L - 16, wireY(q));
+
+    ctx.fillStyle = '#262626';
+    ctx.strokeStyle = '#525252'; ctx.lineWidth = 1;
+    roundRect(ctx, PAD_L - 56, wireY(q) - 11, 36, 22, 3);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#a8a8a8';
+    ctx.font = '11px IBM Plex Mono, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('|0⟩', PAD_L - 56 + 18, wireY(q));
+  }
+
+  // ---- AngleEmbedding: RY ----
+  for (let q = 0; q < N; q++) {
+    drawGate(ryCol, q, 'RY', '#0f62fe', '#78a9ff',
+      { label: `RY(θ${q})`,
+        desc: `AngleEmbedding:\nRY(input[${q}]) on qubit q${q}\nAngle ∈ [−π, +π]\n(tanh(pooled) × π from trunk)` });
+  }
+
+  // ---- StronglyEntanglingLayers ----
+  for (let l = 0; l < LAYERS; l++) {
+    const sec = sections.find(s => s.type === 'layer' && s.l === l);
+    const lc  = layerColors[l];
+    const stride = l + 1;
+
+    for (let q = 0; q < N; q++) {
+      drawGate(sec.rotCol, q, 'ROT', lc.rot, lc.rotBdr,
+        { label: `Rot(φ,θ,ω) — L${l+1} q${q}`,
+          desc: `StronglyEntangling Layer ${l+1}\nRot = RZ(φ) · RY(θ) · RZ(ω)\n3 trainable params\nweight index: [${l},${q},0..2]` });
+    }
+
+    const pairs = cnotPairs(l);
+    for (let k = 0; k < N; k++) {
+      const [ctrl, tgt] = pairs[k];
+      const c = sec.cnotStart + k;
+      drawControl(c, ctrl);
+      drawTarget(c, ctrl, tgt);
+
+      ctx.fillStyle = '#525252';
+      ctx.font = '9px IBM Plex Mono, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText(`s=${stride}`, colX(c), H - PAD_B + 4);
+    }
+  }
+
+  // ---- Measurements ----
+  for (let q = 0; q < N; q++) {
+    drawMeas(measCol, q, q);
+    const mx = colX(measCol) + GATE_W / 2 + 2;
+    ctx.beginPath();
+    ctx.setLineDash([4, 3]);
+    ctx.moveTo(mx, wireY(q) - 3);
+    ctx.lineTo(W - 20, wireY(q) - 3);
+    ctx.moveTo(mx, wireY(q) + 3);
+    ctx.lineTo(W - 20, wireY(q) + 3);
+    ctx.strokeStyle = '#9f1853';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#ff7eb6';
+    ctx.font = '10px IBM Plex Mono, monospace';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(`z${q}`, W - 18, wireY(q));
+  }
+
+  // ---- stride labels at bottom ----
+  ctx.fillStyle = '#3d3d3d';
+  ctx.font = '9px IBM Plex Mono, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+}
+
+draw();
+
+// ---- zoom ----
+function zoom(f) {
+  scale *= f;
+  canvas.style.transform = `scale(${scale})`;
+  canvas.style.transformOrigin = 'top left';
+}
+function resetZoom() {
+  scale = 1;
+  canvas.style.transform = '';
+}
+
+// ---- tooltip ----
+const tip = document.getElementById('tooltip');
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) / scale;
+  const my = (e.clientY - rect.top)  / scale;
+  let found = null;
+  for (let i = gates.length - 1; i >= 0; i--) {
+    const g = gates[i];
+    if (mx >= g.x && mx <= g.x + g.w && my >= g.y && my <= g.y + g.h) {
+      found = g.info; break;
+    }
+  }
+  if (found) {
+    tip.style.display = 'block';
+    tip.style.left = (e.clientX + 14) + 'px';
+    tip.style.top  = (e.clientY + 10) + 'px';
+    tip.innerHTML = `<strong style="color:#78a9ff">${found.label}</strong><br>
+      <span style="color:#c6c6c6;white-space:pre-wrap">${found.desc}</span>`;
+  } else {
+    tip.style.display = 'none';
+  }
+});
+canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+
+// ---- drag to scroll ----
+let drag = false, lastX, lastY;
+const wrap = document.getElementById('canvas-wrap');
+canvas.addEventListener('mousedown', e => { drag=true; lastX=e.clientX; lastY=e.clientY; });
+window.addEventListener('mouseup', () => { drag=false; });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  wrap.scrollLeft -= e.clientX - lastX;
+  wrap.scrollTop  -= e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+});
+</script>
+</body>
+</html>
